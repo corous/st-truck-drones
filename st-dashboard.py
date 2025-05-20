@@ -53,6 +53,7 @@ if "ws_task" not in st.session_state:
 # ---------------------------------------------------------------------------
 # 3. SSE LISTENER
 # ---------------------------------------------------------------------------
+
 def listener() -> None:
     """Connects to SSE_URL, parses each JSON line into st.session_state['vehicles']."""
     client = sseclient.SSEClient(SSE_URL)
@@ -146,14 +147,11 @@ with right:
         try:
             import pandas as pd
             df = pd.read_csv(uploaded_file)
-            # Convert numeric columns to float
-            df['lat'] = df['lat'].astype(float)
-            df['lon'] = df['lon'].astype(float)
-            # Convert to list of dicts and update session state
+            df["lat"] = df["lat"].astype(float)
+            df["lon"] = df["lon"].astype(float)
             st.session_state["stops"] = df.to_dict("records")
             st.success(f"Successfully imported {len(df)} stops")
-            # Force a rerun to update the display
-            st.experimental_rerun()
+            st.rerun()
         except Exception as e:
             st.error(f"Error importing CSV: {str(e)}")
 
