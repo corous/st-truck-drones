@@ -8,16 +8,18 @@
 
 from __future__ import annotations
 import asyncio, json, os, threading
+import requests
+import sseclient
 
 import streamlit as st
 import pydeck as pdk
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION
+# 1. CONFIGURATION
 # ---------------------------------------------------------------------------
 MAPBOX_TOKEN = (
     st.secrets.get("mapbox_token")            # Streamlit secrets
-    or os.getenv("MAPBOX_TOKEN")               # or env‑var for local dev / CI
+    or os.getenv("MAPBOX_TOKEN")               # or env‑var for local dev / CI
 )
 
 if not MAPBOX_TOKEN:
@@ -29,7 +31,7 @@ if not MAPBOX_TOKEN:
 
 pdk.settings.mapbox_api_key = MAPBOX_TOKEN
 
-WS_URL = os.getenv("WS_URL", "wss://backend.example.com/telemetry")  # TODO: change
+SSE_URL = os.getenv("SSE_URL", "https://render-vehicles.onrender.com/stream")  # Render deployment
 
 ICON_URLS = {
     "truck": "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas/cars.png",
@@ -37,12 +39,11 @@ ICON_URLS = {
 }
 
 INITIAL_STOPS = [
-    {"id": "A", "address": "123 Main St", "lat": 33.6846, "lon": -117.8265},
-    {"id": "B", "address": "456 Oak Ave", "lat": 33.6890, "lon": -117.8000},
+    {"id": "A", "address": "Warehouse, 123 Main St", "lat": 33.69321, "lon": -117.83345},
 ]
 
 # ---------------------------------------------------------------------------
-# 2. SESSION STATE BOOTSTRAP
+# 2. SESSION STATE BOOTSTRAP
 # ---------------------------------------------------------------------------
 if "vehicles" not in st.session_state:
     st.session_state["vehicles"] = {}
@@ -50,56 +51,45 @@ if "ws_task" not in st.session_state:
     st.session_state["ws_task"] = None
 
 # ---------------------------------------------------------------------------
-# 3. ASYNC WEBSOCKET LISTENER
+# 3. SSE LISTENER
 # ---------------------------------------------------------------------------
-async def listener() -> None:
-    """Connects to WS_URL, parses each JSON line into st.session_state['vehicles']."""
-    import websockets  # local import so requirements are clear
+def listener() -> None:
+    """Connects to SSE_URL, parses each JSON line into st.session_state['vehicles']."""
+    client = sseclient.SSEClient(SSE_URL)
+    for event in client.events():
+        try:
+            vehicle: dict = json.loads(event.data)
+            st.session_state["vehicles"][vehicle["id"]] = vehicle
+            # flip a bool so Streamlit detects a state change and reruns
+            st.session_state["_ping"] = not st.session_state.get("_ping", False)
+        except json.JSONDecodeError:
+            continue
 
-    async with websockets.connect(WS_URL) as ws:
-        async for message in ws:
-            try:
-                vehicle: dict = json.loads(message)
-                st.session_state["vehicles"][vehicle["id"]] = vehicle
-                # flip a bool so Streamlit detects a state change and reruns
-                st.session_state["_ping"] = not st.session_state.get("_ping", False)
-            except json.JSONDecodeError:
-                continue
-
-
-def ensure_ws_task() -> None:
-    """Guarantees a background thread with its own event‑loop is running."""
+def ensure_listener_task() -> None:
+    """Guarantees a background thread is running."""
     if st.session_state["ws_task"]:
         return  # already spawned
 
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-
     t = threading.Thread(
-        target=loop.run_until_complete,
-        args=(listener(),),
+        target=listener,
         daemon=True,
-        name="ws-listener",
+        name="sse-listener",
     )
     t.start()
     st.session_state["ws_task"] = t
 
-
-ensure_ws_task()
+ensure_listener_task()
 
 # ---------------------------------------------------------------------------
-# 4. UI LAYOUT
+# 4. UI LAYOUT
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Delivery Planner", layout="wide")
 
-st.title("🚚 Truck + 🚁 Drone Delivery Planner")
+st.title("🚚 Truck + 🚁 Drone Delivery Planner")
 
 left, right = st.columns([3, 1])
 
-# ---- 4a. Map pane ----------------------------------------------------------
+# ---- 4a. Map pane ----------------------------------------------------------
 with left:
     stops_layer = pdk.Layer(
         "ScatterplotLayer",
@@ -133,9 +123,9 @@ with left:
 
     st.pydeck_chart(deck, use_container_width=True)
 
-# ---- 4b. Stop list + controls ---------------------------------------------
+# ---- 4b. Stop list + controls ---------------------------------------------
 with right:
-    st.subheader("Stops (drag / edit)")
+    st.subheader("Stops (drag / edit)")
 
     # Convert to & from editor‑friendly dicts
     if "stops" not in st.session_state:
