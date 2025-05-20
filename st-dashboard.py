@@ -146,8 +146,13 @@ with right:
         if up:
             import pandas as pd
             df = pd.read_csv(up)
+            # Convert numeric columns to float
+            df['lat'] = df['lat'].astype(float)
+            df['lon'] = df['lon'].astype(float)
+            # Convert to list of dicts and update session state
             st.session_state["stops"] = df.to_dict("records")
-            st.success("Imported {} stops".format(len(df)))
+            # Force a rerun to update the display
+            st.experimental_rerun()
 
     # -- Commit (stub)
     if col2.button("Commit"):
