@@ -125,7 +125,7 @@ with left:
 
 # ---- 4b. Stop list + controls ---------------------------------------------
 with right:
-    st.subheader("Stops (drag / edit)")
+    st.subheader("Stops (drag to edit)")
 
     # Convert to & from editor‑friendly dicts
     if "stops" not in st.session_state:
@@ -141,18 +141,21 @@ with right:
     col1, col2, col3 = st.columns(3)
 
     # -- Import
-    if col1.button("Import CSV"):
-        up = st.file_uploader("Choose CSV", type=["csv"])
-        if up:
+    uploaded_file = st.file_uploader("Choose CSV", type=["csv"], key="csv_uploader")
+    if uploaded_file is not None:
+        try:
             import pandas as pd
-            df = pd.read_csv(up)
+            df = pd.read_csv(uploaded_file)
             # Convert numeric columns to float
             df['lat'] = df['lat'].astype(float)
             df['lon'] = df['lon'].astype(float)
             # Convert to list of dicts and update session state
             st.session_state["stops"] = df.to_dict("records")
+            st.success(f"Successfully imported {len(df)} stops")
             # Force a rerun to update the display
             st.experimental_rerun()
+        except Exception as e:
+            st.error(f"Error importing CSV: {str(e)}")
 
     # -- Commit (stub)
     if col2.button("Commit"):
