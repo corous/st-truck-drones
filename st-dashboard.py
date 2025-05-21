@@ -59,16 +59,41 @@ for k, v in state_defaults.items():
 # ---------------------------------------------------------------------------
 
 def _sse_listener(url: str) -> None:
-    client = sseclient.SSEClient(url)
-    for event in client.events():
-        try:
-            data = json.loads(event.data)
-            st.session_state["vehicles"][data["id"]] = data
-            st.session_state["_ping"] = not st.session_state.get("_ping", False)
-        except json.JSONDecodeError:
-            continue  # skip malformed
+    """Background thread: consume Server‑Sent Events and update vehicle state.
+    Uses a manual `requests` stream + sseclient parser so we can force UTF‑8
+    decoding (avoids the bytes/str concatenation error on Python 3.13).
+    Re‑connects automatically on any network or parsing error.
+    """
+    import time, requests, sseclient
 
+    while True:  # auto‑reconnect loop
+        try:
+            with requests.get(url, stream=True, timeout=30) as resp:
+                resp.raise_for_status()
+                resp.encoding = "utf-8"          # make iter_lines yield str
+                client = sseclient.SSEClient(resp)
+
+                for event in client.events():
+                    if not event.data:
+                        continue
+                    try:
+                        data = json.loads(event.data)
+                        st.session_state["vehicles"][data["id"]] = data
+                        # trigger Streamlit rerun
+                        st.session_state["_ping"] = not st.session_state.get("_ping", False)
+                    except (json.JSONDecodeError, KeyError):
+                        continue  # skip malformed payloads
+        except Exception as err:
+            # Log then back‑off before retrying
+            print("[SSE] listener error:", err)
+            time.sleep(5)
+            continue
+
+# Spawn the listener exactly once per session
 if st.session_state["_listener"] is None:
+    t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True)
+    t.start()
+    st.session_state["_listener"] = t
     t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True)
     t.start()
     st.session_state["_listener"] = t
