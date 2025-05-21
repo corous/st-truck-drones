@@ -1,31 +1,33 @@
 # st-dashboard.py
-"""Streamlit delivery‑planner dashboard
-   • Real‑time vehicle telemetry via SSE
-   • CSV‑driven stop list with drag‑and‑drop
-   • On *Commit*:
-       1. markers for stops are added/updated
-       2. a naïve route is planned for one truck (blue line) and four drones (purple lines)
-       3. truck/drone routes rendered with PathLayer
+"""Streamlit delivery‑planner dashboard (refresh 2025‑05‑21)
+   ▶ Real‑time vehicle telemetry via SSE
+   ▶ CSV‑driven stop list with drag‑and‑drop editing
+   ▶ 1‑click route planner for 1 truck (blue) + 4 drones (purple)
 
-   Requires: streamlit>=1.33, pydeck>=0.8, sseclient‑py>=0.6
+   Changes in this revision
+   ---------------------------------
+   • Attach a ScriptRunContext to the background SSE thread to suppress
+     “missing ScriptRunContext” warnings under Streamlit ≥ 1.35.
+   • Ensure **one** listener thread (removed accidental double‑spawn).
+   • Add reconnection back‑off and explicit status indicator.
+   • PathLayer now sets a constant width (helps visibility on high‑DPI).
 """
 
 from __future__ import annotations
-import json, os, threading, itertools, random
+import json, os, threading, time
+from typing import List
 
 import streamlit as st
 import pydeck as pdk
 import pandas as pd
-import requests, sseclient  # telemetry
+import requests, sseclient
 
 # ---------------------------------------------------------------------------
-# 1. CONFIGURATION & GLOBALS
+# 1. CONFIGURATION
 # ---------------------------------------------------------------------------
-MAPBOX_TOKEN = (
-    st.secrets.get("mapbox_token") or os.getenv("MAPBOX_TOKEN")
-)
+MAPBOX_TOKEN = st.secrets.get("mapbox_token") or os.getenv("MAPBOX_TOKEN")
 if not MAPBOX_TOKEN:
-    st.error("Missing Mapbox token – set mapbox_token in secrets or env var.")
+    st.error("Missing Mapbox token – add mapbox_token to secrets or env var.")
     st.stop()
 
 pdk.settings.mapbox_api_key = MAPBOX_TOKEN
@@ -37,41 +39,40 @@ ICON_URLS = {
     "drone": "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas/rocket.png",
 }
 
-# Default single warehouse placeholder – will be overridden by CSV / editor
+# Warehouse placeholder (lat/lon ≈ Irvine, CA)
 INITIAL_STOPS = [
     {"id": "WH", "address": "Warehouse", "lat": 33.69321, "lon": -117.83345},
 ]
 
 # ---------------------------------------------------------------------------
-# 2. SESSION STATE INITIALISATION
+# 2.  SESSION STATE DEFAULTS
 # ---------------------------------------------------------------------------
-state_defaults = {
-    "vehicles": {},     # live telemetry
-    "stops": INITIAL_STOPS.copy(),
-    "routes": None,     # {'truck': [...], 'drones': [[...], ...]}
-    "_listener": None,  # background thread reference
-}
+state_defaults = dict(
+    vehicles={},          # live positions keyed by id
+    stops=INITIAL_STOPS.copy(),
+    routes=None,          # {truck: [...], drones: [[...], ...]}
+    listener=None,        # thread ref
+    sse_status="🔄 connecting…",
+)
 for k, v in state_defaults.items():
     st.session_state.setdefault(k, v)
 
 # ---------------------------------------------------------------------------
-# 3.  TELEMETRY LISTENER (SSE → session_state['vehicles'])
+# 3.  BACKGROUND SSE LISTENER
 # ---------------------------------------------------------------------------
+from streamlit.runtime.scriptrunner import add_script_run_ctx  # type: ignore
 
-def _sse_listener(url: str) -> None:
-    """Background thread: consume Server‑Sent Events and update vehicle state.
-    Uses a manual `requests` stream + sseclient parser so we can force UTF‑8
-    decoding (avoids the bytes/str concatenation error on Python 3.13).
-    Re‑connects automatically on any network or parsing error.
-    """
-    import time, requests, sseclient
+def _sse_listener(url: str):
+    """Runs in a daemon thread. Updates st.session_state['vehicles']."""
+    add_script_run_ctx(threading.current_thread())  # attach context → no warnings
 
-    while True:  # auto‑reconnect loop
+    while True:
         try:
             with requests.get(url, stream=True, timeout=30) as resp:
                 resp.raise_for_status()
-                resp.encoding = "utf-8"          # make iter_lines yield str
+                resp.encoding = "utf-8"
                 client = sseclient.SSEClient(resp)
+                st.session_state["sse_status"] = "🟢 live"  # show status badge
 
                 for event in client.events():
                     if not event.data:
@@ -79,35 +80,32 @@ def _sse_listener(url: str) -> None:
                     try:
                         data = json.loads(event.data)
                         st.session_state["vehicles"][data["id"]] = data
-                        # trigger Streamlit rerun
                         st.session_state["_ping"] = not st.session_state.get("_ping", False)
                     except (json.JSONDecodeError, KeyError):
-                        continue  # skip malformed payloads
+                        continue
         except Exception as err:
-            # Log then back‑off before retrying
-            print("[SSE] listener error:", err)
+            st.session_state["sse_status"] = "🔴 disconnected – retrying…"
+            print("[SSE]", err)
             time.sleep(5)
             continue
 
-# Spawn the listener exactly once per session
-if st.session_state["_listener"] is None:
-    t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True)
+# spawn exactly once
+if st.session_state["listener"] is None:
+    t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True, name="sse")
     t.start()
-    st.session_state["_listener"] = t
-    t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True)
-    t.start()
-    st.session_state["_listener"] = t
+    st.session_state["listener"] = t
 
 # ---------------------------------------------------------------------------
 # 4.  PAGE LAYOUT
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="Delivery Planner", layout="wide")
-st.title("🚚 Truck + 🚁 Drone Delivery Planner")
-left, right = st.columns([3, 1])
+st.title("🚚 Truck + 🚁 Drone Delivery Planner")
+st.caption(f"SSE feed status: {st.session_state['sse_status']}")
 
-# ---------------------------- 4A  MAP PANEL ------------------------------- #
+left, right = st.columns([3, 1], gap="small")
+
+# ----------------------- 4A  MAP PANE ----------------------- #
 with left:
-    # Scatterplot for stops (red)
     stops_layer = pdk.Layer(
         "ScatterplotLayer",
         data=st.session_state["stops"],
@@ -116,42 +114,38 @@ with left:
         get_fill_color=[255, 0, 0],
     )
 
-    # Icon layer for live truck/drone positions
     veh_layer = pdk.Layer(
         "IconLayer",
         data=list(st.session_state["vehicles"].values()),
         get_position="[lon, lat]",
         get_icon="type",
-        icon_mapping={
-            k: {"url": url, "width": 128, "height": 128, "anchorY": 128}
-            for k, url in ICON_URLS.items()
-        },
+        icon_mapping={k: {"url": v, "width": 128, "height": 128, "anchorY": 128} for k, v in ICON_URLS.items()},
         get_size=4,
         size_scale=15,
         get_rotation="[heading]",
     )
 
-    layers = [stops_layer, veh_layer]
+    layers: List[pdk.Layer] = [stops_layer, veh_layer]
 
-    # Path layers if routes have been planned
     if st.session_state["routes"]:
-        truck_path = pdk.Layer(
-            "PathLayer",
-            data=[{"path": st.session_state["routes"]["truck"]}],
-            get_path="path",
-            get_color=[0, 0, 255],         # blue
-            width_scale=20,
-            width_min_pixels=3,
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                data=[{"path": st.session_state["routes"]["truck"], "name": "truck"}],
+                get_path="path",
+                get_color=[0, 0, 255],  # blue
+                get_width=5,
+            )
         )
-        drone_paths = pdk.Layer(
-            "PathLayer",
-            data=[{"path": p} for p in st.session_state["routes"]["drones"]],
-            get_path="path",
-            get_color=[128, 0, 128],       # purple
-            width_scale=12,
-            width_min_pixels=2,
+        layers.append(
+            pdk.Layer(
+                "PathLayer",
+                data=[{"path": p} for p in st.session_state["routes"]["drones"]],
+                get_path="path",
+                get_color=[128, 0, 128],  # purple
+                get_width=4,
+            )
         )
-        layers.extend([truck_path, drone_paths])
 
     deck = pdk.Deck(
         map_style="mapbox://styles/mapbox/streets-v12",
@@ -164,11 +158,9 @@ with left:
     )
     st.pydeck_chart(deck, use_container_width=True)
 
-# ------------------------ 4B  STOP LIST + CONTROLS ------------------------ #
+# ----------------------- 4B  CONTROL PANE ------------------- #
 with right:
-    st.subheader("Stops (drag to edit or CSV import)")
-
-    # Editable grid
+    st.subheader("Stops (edit or import)")
     st.session_state["stops"] = st.data_editor(
         st.session_state["stops"],
         num_rows="dynamic",
@@ -176,57 +168,49 @@ with right:
         key="stops_editor",
     )
 
-    # File uploader
-    uploaded = st.file_uploader("Import CSV", type=["csv"], key="csv_uploader")
+    uploaded = st.file_uploader("Import CSV", type=["csv"], key="uploader")
     if uploaded:
         try:
             df = pd.read_csv(uploaded)
             df["lat"] = df["lat"].astype(float)
             df["lon"] = df["lon"].astype(float)
             st.session_state["stops"] = df.to_dict("records")
-            st.success(f"Imported {len(df)} stops from CSV")
-            st.rerun()
-        except Exception as exc:
-            st.error(f"CSV import failed: {exc}")
+            st.success(f"Imported {len(df)} stops from CSV – click Commit to plan.")
+        except Exception as e:
+            st.error(f"CSV import failed: {e}")
 
-    col1, col2, col3 = st.columns(3)
+    col1, col2 = st.columns(2)
 
-    # ---------------- Commit button -----------------
+    # ---------- Commit / Plan Route ---------- #
     def plan_routes():
         stops = st.session_state["stops"]
         if len(stops) < 2:
-            st.warning("Need at least two stops (warehouse + 1 delivery) to plan routes.")
+            st.warning("Need at least a warehouse and one delivery stop.")
             return
 
-        # Warehouse is first entry
-        origin = stops[0]
-        warehouse_coord = [origin["lon"], origin["lat"]]
+        warehouse = stops[0]
+        wh = [warehouse["lon"], warehouse["lat"]]
 
-        # ---- Truck path: warehouse -> all stops in order -> warehouse ----
-        truck_path = [warehouse_coord] + [[s["lon"], s["lat"]] for s in stops[1:]] + [warehouse_coord]
+        truck_path = [wh] + [[s["lon"], s["lat"]] for s in stops[1:]] + [wh]
 
-        # ---- Drone paths: round‑robin assignment excluding warehouse ----
-        deliveries = stops[1:]
         drone_bins = [[] for _ in range(4)]
-        for idx, stop in enumerate(deliveries):
+        for idx, stop in enumerate(stops[1:]):
             drone_bins[idx % 4].append(stop)
 
-        drone_paths: list[list[list[float]]] = []
-        for bin_ in drone_bins:
-            if not bin_:
-                continue  # fewer stops than drones
-            path = [warehouse_coord] + [[s["lon"], s["lat"]] for s in bin_] + [warehouse_coord]
-            drone_paths.append(path)
+        drone_paths = []
+        for bucket in drone_bins:
+            if bucket:
+                drone_paths.append([wh] + [[s["lon"], s["lat"]] for s in bucket] + [wh])
 
         st.session_state["routes"] = {"truck": truck_path, "drones": drone_paths}
-        st.success("✅ Routes planned and drawn on the map.")
+        st.success("✅ Routes planned – map updated.")
         st.rerun()
 
-    if col2.button("Commit / Plan Route"):
+    if col1.button("Commit / Plan Route"):
         plan_routes()
 
-    # ---------------- Reset vehicles (telemetry) ----------------
-    if col3.button("Reset Vehicles"):
+    # ---------- Reset Telemetry ---------- #
+    if col2.button("Reset Telemetry"):
         st.session_state["vehicles"].clear()
         st.session_state["_ping"] = not st.session_state.get("_ping", False)
         st.info("Vehicle positions cleared.")
