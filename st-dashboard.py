@@ -164,7 +164,7 @@ with left:
                 "PathLayer",
                 data=[{"path": p} for p in st.session_state["routes"]["drones"]],
                 get_path="path",
-                get_color=[255, 165, 0],
+                get_color=[128, 0, 128],
                 get_width=10,
             )
         )
