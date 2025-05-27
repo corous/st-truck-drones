@@ -147,7 +147,7 @@ with left:
         get_rotation="[heading]",
     )
 
-        layers: List[pdk.Layer] = [depot_layer, stops_layer, veh_layer]
+    layers: List[pdk.Layer] = [depot_layer, stops_layer, veh_layer]
 
     if st.session_state["routes"]:
         layers.append(
@@ -203,7 +203,7 @@ with right:
 
     col1, col2 = st.columns(2)
 
-        def haversine_miles(lat1, lon1, lat2, lon2):
+    def haversine_miles(lat1, lon1, lat2, lon2):
         R = 3958.8  # Earth radius in miles
         phi1, phi2 = math.radians(lat1), math.radians(lat2)
         dphi = math.radians(lat2 - lat1)
