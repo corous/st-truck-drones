@@ -1,20 +1,20 @@
 # st-dashboard.py
-"""Streamlit delivery-planner dashboard (hot-fix 2025-05-22)
-   • Real-time vehicle telemetry via SSE
+"""Streamlit delivery‑planner dashboard (hot‑fix 2025‑05‑22)
+   • Real‑time vehicle telemetry via SSE
    • CSV/GUI stop editing and simple route planning
    • Renders truck (blue) + drone (purple) paths on Mapbox map
 
-   Hot-fix notes
+   Hot‑fix notes
    -----------------------------
    1. *add_script_run_ctx* import now optional. If running on a Streamlit
-      build that doesn't expose the internal API the dashboard still loads
+      build that doesn’t expose the internal API the dashboard still loads
       (context attachment is skipped, warnings may appear but are harmless).
    2. Ensured `st.set_page_config(...)` is the very first Streamlit call
       to avoid silent layout failures on some Streamlit Cloud images.
 """
 
 from __future__ import annotations
-import json, os, threading, time
+import json, os, threading, time, math
 from typing import List
 
 import streamlit as st
@@ -32,7 +32,7 @@ st.set_page_config(page_title="Delivery Planner", layout="wide")
 # ---------------------------------------------------------------------------
 MAPBOX_TOKEN = st.secrets.get("mapbox_token") or os.getenv("MAPBOX_TOKEN")
 if not MAPBOX_TOKEN:
-    st.error("Missing Mapbox token - add mapbox_token to secrets or env var.")
+    st.error("Missing Mapbox token – add mapbox_token to secrets or env var.")
     st.stop()
 
 pdk.settings.mapbox_api_key = MAPBOX_TOKEN
@@ -118,9 +118,19 @@ left, right = st.columns([3, 1], gap="small")
 
 # ----------------------- MAP PANE ----------------------- #
 with left:
+        # Green dot for warehouse (first stop)
+    depot_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=[st.session_state["stops"][0]],
+        get_position="[lon, lat]",
+        get_radius=90,
+        get_fill_color=[0, 180, 0],
+    )
+
+    # Red dots for all other stops
     stops_layer = pdk.Layer(
         "ScatterplotLayer",
-        data=st.session_state["stops"],
+        data=st.session_state["stops"][1:],
         get_position="[lon, lat]",
         get_radius=70,
         get_fill_color=[255, 0, 0],
@@ -137,7 +147,7 @@ with left:
         get_rotation="[heading]",
     )
 
-    layers: List[pdk.Layer] = [stops_layer, veh_layer]
+        layers: List[pdk.Layer] = [depot_layer, stops_layer, veh_layer]
 
     if st.session_state["routes"]:
         layers.append(
@@ -193,75 +203,89 @@ with right:
 
     col1, col2 = st.columns(2)
 
+        def haversine_miles(lat1, lon1, lat2, lon2):
+        R = 3958.8  # Earth radius in miles
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = math.radians(lat2 - lat1)
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
+        return 2*R*math.atan2(math.sqrt(a), math.sqrt(1-a))
+
     def plan_routes():
-        """Plan routes using the multi-agent logic from `Multi-Agent Model.py`.
-        • First stop = warehouse / depot
-        • Last stop   = destination (truck must visit it)
-        • Column `drone` (0/1 or True/False) marks whether a customer *can* be
-          served by a UAV.  Missing / 0 ⇒ truck must visit.
-        """
+        """Multi‑agent planner with 3‑mile drone range and depot green marker."""
         stops = st.session_state["stops"]
         if len(stops) < 2:
-            st.warning("Need at least depot + destination + (optional) customers.")
+            st.warning("Need at least depot and one destination/customer.")
             return
 
-        # Build helper lists keeping original table order (index = position).
-        truck_route_indices = []
-        for idx, s in enumerate(stops):
-            if str(s.get("drone", 0)).lower() in ("0", "false", "no", "", "nan"):
-                truck_route_indices.append(idx)
-        # Ensure depot (0) and destination (len-1) are in the truck route.
-        if 0 not in truck_route_indices:
-            truck_route_indices.insert(0, 0)
-        if len(stops) - 1 not in truck_route_indices:
-            truck_route_indices.append(len(stops) - 1)
-        truck_route_indices = sorted(set(truck_route_indices))
+        RANGE_MILES = 3.0
 
-        # Truck path in index order.
-        truck_path = [[stops[i]["lon"], stops[i]["lat"]] for i in truck_route_indices]
+        # Build initial truck list (all non‑drone or out‑of‑range customers will land here)
+        truck_indices = {0, len(stops)-1}  # depot & final destination always truck
 
-        # Drone-eligible indices (exclude depot & destination)
-        drone_candidates = [i for i, s in enumerate(stops)
-                             if str(s.get("drone", 0)).lower() in ("1", "true", "yes")
-                             and i not in (0, len(stops)-1)]
+        drone_candidates = []
+        for idx, s in enumerate(stops[1:-1], start=1):
+            flag = str(s.get("drone", 0)).lower()
+            if flag in ("1", "true", "yes"):
+                drone_candidates.append(idx)
+            else:
+                truck_indices.add(idx)
 
-        # Assign sorties round-robin among four drones.
-        NUM_DRONES = 4
-        drone_paths: list[list[list[float]]] = [[] for _ in range(NUM_DRONES)]
-        sortie_counter = 0
+        # insert customers violating range back to truck later
+        launch_cache = {}
+        recover_cache = {}
 
+        def nearest_prev_truck(i):
+            if i in launch_cache:
+                return launch_cache[i]
+            prev = max([idx for idx in sorted(truck_indices) if idx < i], default=0)
+            launch_cache[i] = prev
+            return prev
+
+        def nearest_next_truck(i):
+            if i in recover_cache:
+                return recover_cache[i]
+            nxt = min([idx for idx in sorted(truck_indices) if idx > i], default=len(stops)-1)
+            recover_cache[i] = nxt
+            return nxt
+
+        feasible_drone_idxs = []
         for cust_idx in drone_candidates:
-            # launch = nearest preceding truck node
-            launch_candidates = [j for j in truck_route_indices if j < cust_idx]
-            launch_idx = max(launch_candidates) if launch_candidates else truck_route_indices[0]
-            # recovery = nearest following truck node
-            recov_candidates = [j for j in truck_route_indices if j > cust_idx]
-            recov_idx = min(recov_candidates) if recov_candidates else truck_route_indices[-1]
+            launch_idx = nearest_prev_truck(cust_idx)
+            recov_idx  = nearest_next_truck(cust_idx)
+            dist_miles = (
+                haversine_miles(stops[launch_idx]["lat"], stops[launch_idx]["lon"], stops[cust_idx]["lat"], stops[cust_idx]["lon"]) +
+                haversine_miles(stops[cust_idx]["lat"], stops[cust_idx]["lon"], stops[recov_idx]["lat"], stops[recov_idx]["lon"])
+            )
+            if dist_miles <= RANGE_MILES:
+                feasible_drone_idxs.append((cust_idx, launch_idx, recov_idx))
+            else:
+                truck_indices.add(cust_idx)
 
-            launch_coord = [stops[launch_idx]["lon"], stops[launch_idx]["lat"]]
-            cust_coord   = [stops[cust_idx]["lon"], stops[cust_idx]["lat"]]
-            recov_coord  = [stops[recov_idx]["lon"], stops[recov_idx]["lat"]]
+        truck_path = [[stops[i]["lon"], stops[i]["lat"]] for i in sorted(truck_indices)]
 
-            drone_id = sortie_counter % NUM_DRONES
-            drone_paths[drone_id].append([launch_coord, cust_coord, recov_coord])
-            sortie_counter += 1
+        NUM_DRONES = 4
+        drone_bins: list[list[tuple]] = [[] for _ in range(NUM_DRONES)]
+        for n, triple in enumerate(feasible_drone_idxs):
+            drone_bins[n % NUM_DRONES].append(triple)
 
-        # Flatten sorties per drone into single polyline (launch → cust → recov → …)
-        flat_drone_paths = []
-        for paths in drone_paths:
-            if not paths:
+        drone_polylines: list[list[list[float]]] = []
+        for bin_ in drone_bins:
+            if not bin_:
                 continue
             poly: list[list[float]] = []
-            for segment in paths:
-                # Stitch segments end-to-end (avoid duplicate launch if contiguous)
-                if poly and poly[-1] == segment[0]:
-                    poly.extend(segment[1:])
+            for cust_idx, launch_idx, recov_idx in bin_:
+                launch = [stops[launch_idx]["lon"], stops[launch_idx]["lat"]]
+                cust   = [stops[cust_idx]["lon"], stops[cust_idx]["lat"]]
+                recov  = [stops[recov_idx]["lon"], stops[recov_idx]["lat"]]
+                if poly and poly[-1] == launch:
+                    poly.extend([cust, recov])
                 else:
-                    poly.extend(segment)
-            flat_drone_paths.append(poly)
+                    poly.extend([launch, cust, recov])
+            drone_polylines.append(poly)
 
-        st.session_state["routes"] = {"truck": truck_path, "drones": flat_drone_paths}
-        st.success("✅ Routes planned using multi-agent logic – map updated.")
+        st.session_state["routes"] = {"truck": truck_path, "drones": drone_polylines}
+        st.success("✅ Routes replanned with 3‑mile drone limit – map updated.")
         st.rerun()
 
     if col1.button("Commit / Plan Route"):
