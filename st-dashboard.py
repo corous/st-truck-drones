@@ -156,7 +156,7 @@ with left:
                 data=[{"path": st.session_state["routes"]["truck"]}],
                 get_path="path",
                 get_color=[0, 0, 255],
-                get_width=5,
+                get_width=10,
             )
         )
         layers.append(
@@ -165,7 +165,7 @@ with left:
                 data=[{"path": p} for p in st.session_state["routes"]["drones"]],
                 get_path="path",
                 get_color=[255, 165, 0],
-                get_width=4,
+                get_width=10,
             )
         )
 
