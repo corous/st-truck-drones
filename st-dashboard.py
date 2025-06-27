@@ -1,13 +1,13 @@
 # st-dashboard.py
-"""Streamlit delivery‑planner dashboard (hot‑fix 2025‑05‑22)
-   • Real‑time vehicle telemetry via SSE
+"""Streamlit delivery-planner dashboard (hot-fix 2025-05-22)
+   • Real-time vehicle telemetry via SSE
    • CSV/GUI stop editing and simple route planning
    • Renders truck (blue) + drone (purple) paths on Mapbox map
 
-   Hot‑fix notes
+   Hot-fix notes
    -----------------------------
    1. *add_script_run_ctx* import now optional. If running on a Streamlit
-      build that doesn’t expose the internal API the dashboard still loads
+      build that doesn't expose the internal API the dashboard still loads
       (context attachment is skipped, warnings may appear but are harmless).
    2. Ensured `st.set_page_config(...)` is the very first Streamlit call
       to avoid silent layout failures on some Streamlit Cloud images.
@@ -32,8 +32,10 @@ st.set_page_config(page_title="Delivery Planner", layout="wide")
 # ---------------------------------------------------------------------------
 MAPBOX_TOKEN = st.secrets.get("mapbox_token") or os.getenv("MAPBOX_TOKEN")
 if not MAPBOX_TOKEN:
-    st.error("Missing Mapbox token – add mapbox_token to secrets or env var.")
+    st.error("Missing Mapbox token - add mapbox_token to secrets or env var.")
     st.stop()
+else:
+    print("MAPBOX_TOKEN starts with:", MAPBOX_TOKEN[:6])
 
 pdk.settings.mapbox_api_key = MAPBOX_TOKEN
 
@@ -177,7 +179,9 @@ with left:
             zoom=12,
         ),
         layers=layers,
+        api_keys={"mapbox": MAPBOX_TOKEN},   # ← new, explicit
     )
+
     st.pydeck_chart(deck, use_container_width=True)
 
 # ----------------------- CONTROL PANE ------------------- #
@@ -215,7 +219,7 @@ with right:
         """Plan routes *without* a drone flag column.
         • Every stop except depot (row 0) and final destination (last row)
           is *initially* considered for drone service.
-        • A stop is eligible for a drone *only if* a round‑trip from its
+        • A stop is eligible for a drone *only if* a round-trip from its
           nearest preceding & following truck nodes is ≤ 3.0 statute miles.
         • Any stop beyond that radius remains on the truck route.
         """
@@ -287,7 +291,7 @@ with right:
             drone_polylines.append(poly)
 
         st.session_state["routes"] = {"truck": truck_path, "drones": drone_polylines}
-        st.success("✅ Routes replanned (3‑mile drone eligibility) – map updated.")
+        st.success("✅ Routes replanned (3-mile drone eligibility) – map updated.")
         st.rerun()
 
     if col1.button("Commit / Plan Route"):
