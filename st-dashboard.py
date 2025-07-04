@@ -309,8 +309,7 @@ with right:
         for a, b in zip(truck_indices_sorted, truck_indices_sorted[1:]):
             road_segments += road_segment(
                 stops[a]["lon"], stops[a]["lat"],
-                stops[b]["lon"], stops[b]["lat"],
-                MAPBOX_TOKEN,
+                stops[b]["lon"], stops[b]["lat"]
             )
         # use the new road_segments function    
         truck_path = road_segments
