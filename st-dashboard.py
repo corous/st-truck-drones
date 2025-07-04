@@ -1,45 +1,30 @@
-# st-dashboard.py
-"""Streamlit delivery-planner dashboard (hot-fix 2025-05-22)
-   • Real-time vehicle telemetry via SSE
-   • CSV/GUI stop editing and simple route planning
-   • Renders truck (blue) + drone (purple) paths on Mapbox map
-
-   Hot-fix notes
-   -----------------------------
-   1. *add_script_run_ctx* import now optional. If running on a Streamlit
-      build that doesn't expose the internal API the dashboard still loads
-      (context attachment is skipped, warnings may appear but are harmless).
-   2. Ensured `st.set_page_config(...)` is the very first Streamlit call
-      to avoid silent layout failures on some Streamlit Cloud images.
-"""
+# st-dashboard.py – full file (2025‑06‑27)
+# --------------------------------------------------------------
+# Streamlit dashboard for planning + live‑tracking
+#  • Mapbox basemap & real‑time vehicle icons via SSE
+#  • Truck route now follows actual roads (Mapbox Directions API)
+# --------------------------------------------------------------
 
 from __future__ import annotations
-import json, os, threading, time, math
+import json, os, threading, time, math, requests, polyline
 from typing import List
 
 import streamlit as st
 import pydeck as pdk
 import pandas as pd
-import requests, sseclient
+import sseclient
 
-# ---------------------------------------------------------------------------
-# 1.  PAGE CONFIG (must be first Streamlit call)
-# ---------------------------------------------------------------------------
-st.set_page_config(page_title="Delivery Planner", layout="wide")
-
-# ---------------------------------------------------------------------------
-# 2.  CONFIG & CONSTANTS
-# ---------------------------------------------------------------------------
+# ----------------------- mapbox + telemetry config ----------------------- #
 MAPBOX_TOKEN = st.secrets.get("mapbox_token") or os.getenv("MAPBOX_TOKEN")
 if not MAPBOX_TOKEN:
-    st.error("Missing Mapbox token - add mapbox_token to secrets or env var.")
+    st.error("Missing Mapbox token – set mapbox_token in secrets or env var.")
     st.stop()
-else:
-    print("MAPBOX_TOKEN starts with:", MAPBOX_TOKEN[:6])
 
-pdk.settings.mapbox_api_key = MAPBOX_TOKEN
-
+MB_DIRECTIONS = "https://api.mapbox.com/directions/v5/mapbox/driving"
 SSE_URL = os.getenv("SSE_URL", "https://render-vehicles.onrender.com/stream")
+START_DELAY_SEC = 30  # simulator warm‑up delay
+
+pdk.settings.mapbox_api_key = MAPBOX_TOKEN  # fallback for older pydeck
 
 ICON_URLS = {
     "truck": "https://raw.githubusercontent.com/visgl/deck.gl-data/master/website/icon-atlas/cars.png",
@@ -50,77 +35,71 @@ INITIAL_STOPS = [
     {"id": "WH", "address": "Warehouse", "lat": 33.69321, "lon": -117.83345},
 ]
 
-# ---------------------------------------------------------------------------
-# 3.  SESSION STATE DEFAULTS
-# ---------------------------------------------------------------------------
-state_defaults = dict(
+# ----------------------- geometry helpers ------------------------------- #
+EARTH_MI = 3958.8
+
+def haversine_miles(lat1, lon1, lat2, lon2):
+    phi1, phi2 = map(math.radians, (lat1, lat2))
+    dphi = math.radians(lat2 - lat1)
+    dlambda = math.radians(lon2 - lon1)
+    a = (
+        math.sin(dphi / 2) ** 2
+        + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2) ** 2
+    )
+    return 2 * EARTH_MI * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+# ----------------------- road‑aligned path via Mapbox -------------------- #
+
+def road_path(lon1, lat1, lon2, lat2) -> List[List[float]]:
+    url = f"{MB_DIRECTIONS}/{lon1},{lat1};{lon2},{lat2}"
+    params = {
+        "geometries": "polyline6",
+        "overview": "full",
+        "access_token": MAPBOX_TOKEN,
+    }
+    r = requests.get(url, params=params, timeout=10)
+    r.raise_for_status()
+    coords = polyline.decode(r.json()["routes"][0]["geometry"], precision=6)
+    return [[lon, lat] for lat, lon in coords]
+
+# ----------------------- session‑state defaults -------------------------- #
+def_state = dict(
     vehicles={},
     stops=INITIAL_STOPS.copy(),
     routes=None,
     listener=None,
     sse_status="🔄 connecting…",
 )
-for k, v in state_defaults.items():
+for k, v in def_state.items():
     st.session_state.setdefault(k, v)
 
-# ---------------------------------------------------------------------------
-# 4.  Optional import of add_script_run_ctx
-# ---------------------------------------------------------------------------
-try:
-    from streamlit.runtime.scriptrunner import add_script_run_ctx  # type: ignore
-    _ATTACH_CTX = True
-except Exception:
-    _ATTACH_CTX = False
+# ----------------------- SSE background thread --------------------------- #
 
-# ---------------------------------------------------------------------------
-# 5.  SSE LISTENER (runs in daemon thread)
-# ---------------------------------------------------------------------------
-
-def _sse_listener(url: str):
-    if _ATTACH_CTX:
+def _sse_listener():
+    time.sleep(START_DELAY_SEC)  # wait for simulator
+    client = sseclient.SSEClient(SSE_URL)
+    for evt in client.events():
         try:
-            add_script_run_ctx(threading.current_thread())
+            data = json.loads(evt.data)
+            st.session_state["vehicles"][data["id"]] = data
+            st.session_state["_ping"] = not st.session_state.get("_ping", False)
+            st.session_state["sse_status"] = "🟢 live"
         except Exception:
-            pass
-
-    while True:
-        try:
-            with requests.get(url, stream=True, timeout=30) as resp:
-                resp.raise_for_status()
-                resp.encoding = "utf-8"
-                client = sseclient.SSEClient(resp)
-                st.session_state["sse_status"] = "🟢 live"
-
-                for event in client.events():
-                    if not event.data:
-                        continue
-                    try:
-                        data = json.loads(event.data)
-                        st.session_state["vehicles"][data["id"]] = data
-                        st.session_state["_ping"] = not st.session_state.get("_ping", False)
-                    except (json.JSONDecodeError, KeyError):
-                        continue
-        except Exception as err:
-            st.session_state["sse_status"] = "🔴 disconnected – retrying…"
-            print("[SSE]", err)
-            time.sleep(5)
             continue
 
 if st.session_state["listener"] is None:
-    t = threading.Thread(target=_sse_listener, args=(SSE_URL,), daemon=True, name="sse")
+    t = threading.Thread(target=_sse_listener, daemon=True)
     t.start()
     st.session_state["listener"] = t
 
-# ---------------------------------------------------------------------------
-# 6.  UI LAYOUT
-# ---------------------------------------------------------------------------
+# ----------------------- UI layout --------------------------------------- #
+st.set_page_config(page_title="Delivery Planner", layout="wide")
 st.title("🚚 Truck + 🚁 Drone Delivery Planner")
 st.caption(f"SSE feed status: {st.session_state['sse_status']}")
 left, right = st.columns([3, 1], gap="small")
 
-# ----------------------- MAP PANE ----------------------- #
+# ----------------------- Map panel --------------------------------------- #
 with left:
-    # Green dot for warehouse (first stop)
     depot_layer = pdk.Layer(
         "ScatterplotLayer",
         data=[st.session_state["stops"][0]],
@@ -128,29 +107,24 @@ with left:
         get_radius=90,
         get_fill_color=[0, 180, 0],
     )
-
-    # Red dots for all other stops
-    stops_layer = pdk.Layer(
+    stop_layer = pdk.Layer(
         "ScatterplotLayer",
         data=st.session_state["stops"][1:],
         get_position="[lon, lat]",
         get_radius=70,
         get_fill_color=[255, 0, 0],
     )
-
     veh_layer = pdk.Layer(
         "IconLayer",
         data=list(st.session_state["vehicles"].values()),
         get_position="[lon, lat]",
         get_icon="type",
-        icon_mapping={k: {"url": v, "width": 128, "height": 128, "anchorY": 128} for k, v in ICON_URLS.items()},
+        icon_mapping={k: {"url": u, "width": 128, "height": 128, "anchorY": 128} for k, u in ICON_URLS.items()},
         get_size=4,
         size_scale=15,
         get_rotation="[heading]",
     )
-
-    layers: List[pdk.Layer] = [depot_layer, stops_layer, veh_layer]
-
+    layers: List[pdk.Layer] = [depot_layer, stop_layer, veh_layer]
     if st.session_state["routes"]:
         layers.append(
             pdk.Layer(
@@ -158,7 +132,7 @@ with left:
                 data=[{"path": st.session_state["routes"]["truck"]}],
                 get_path="path",
                 get_color=[0, 0, 255],
-                get_width=10,
+                get_width=5,
             )
         )
         layers.append(
@@ -167,10 +141,9 @@ with left:
                 data=[{"path": p} for p in st.session_state["routes"]["drones"]],
                 get_path="path",
                 get_color=[128, 0, 128],
-                get_width=10,
+                get_width=4,
             )
         )
-
     deck = pdk.Deck(
         map_style="mapbox://styles/mapbox/streets-v12",
         initial_view_state=pdk.ViewState(
@@ -179,12 +152,11 @@ with left:
             zoom=12,
         ),
         layers=layers,
-        api_keys={"mapbox": MAPBOX_TOKEN},   # ← new, explicit
+        api_keys={"mapbox": MAPBOX_TOKEN},  # ensure token reaches browser
     )
-
     st.pydeck_chart(deck, use_container_width=True)
 
-# ----------------------- CONTROL PANE ------------------- #
+# ----------------------- Control panel ------------------------------------ #
 with right:
     st.subheader("Stops (edit or import)")
     st.session_state["stops"] = st.data_editor(
@@ -193,115 +165,88 @@ with right:
         use_container_width=True,
         key="stops_editor",
     )
-
-    uploaded = st.file_uploader("Import CSV", type=["csv"], key="uploader")
-    if uploaded:
+    up = st.file_uploader("Import CSV", type=["csv"])
+    if up:
         try:
-            df = pd.read_csv(uploaded)
-            df["lat"] = df["lat"].astype(float)
-            df["lon"] = df["lon"].astype(float)
+            df = pd.read_csv(up)
+            df["lat"], df["lon"] = df["lat"].astype(float), df["lon"].astype(float)
             st.session_state["stops"] = df.to_dict("records")
-            st.success(f"Imported {len(df)} stops from CSV – click Commit to plan.")
+            st.success(f"Imported {len(df)} stops – click Commit.")
         except Exception as e:
-            st.error(f"CSV import failed: {e}")
+            st.error(str(e))
 
     col1, col2 = st.columns(2)
 
-    def haversine_miles(lat1, lon1, lat2, lon2):
-        R = 3958.8  # Earth radius in miles
-        phi1, phi2 = math.radians(lat1), math.radians(lat2)
-        dphi = math.radians(lat2 - lat1)
-        dlambda = math.radians(lon2 - lon1)
-        a = math.sin(dphi/2)**2 + math.cos(phi1)*math.cos(phi2)*math.sin(dlambda/2)**2
-        return 2*R*math.atan2(math.sqrt(a), math.sqrt(1-a))
-
+    # ---------------- route planner (truck uses Mapbox road path) ---------- #
     def plan_routes():
-        """Plan routes *without* a drone flag column.
-        • Every stop except depot (row 0) and final destination (last row)
-          is *initially* considered for drone service.
-        • A stop is eligible for a drone *only if* a round-trip from its
-          nearest preceding & following truck nodes is ≤ 3.0 statute miles.
-        • Any stop beyond that radius remains on the truck route.
-        """
         stops = st.session_state["stops"]
         if len(stops) < 2:
-            st.warning("Need at least depot and one destination/customer.")
+            st.warning("Need at least depot and one customer.")
             return
-
-        RANGE_MILES = 3.0
-
-        # Truck must at least visit depot and final destination
-        truck_indices = {0, len(stops) - 1}
-
-        # Helper caches (keyed by stop index) for nearest truck nodes
+        RANGE = 3.0
+        truck_set = {0, len(stops) - 1}
         prev_cache, next_cache = {}, {}
 
-        def prev_truck(idx: int) -> int:
-            if idx in prev_cache:
-                return prev_cache[idx]
-            prev_cache[idx] = max(j for j in truck_indices if j < idx)
-            return prev_cache[idx]
+        def prev_truck(i):
+            if i not in prev_cache:
+                prev_cache[i] = max(j for j in truck_set if j < i)
+            return prev_cache[i]
 
-        def next_truck(idx: int) -> int:
-            if idx in next_cache:
-                return next_cache[idx]
-            next_cache[idx] = min(j for j in truck_indices if j > idx)
-            return next_cache[idx]
+        def next_truck(i):
+            if i not in next_cache:
+                next_cache[i] = min(j for j in truck_set if j > i)
+            return next_cache[i]
 
-        drone_assignments = []  # list of (cust_idx, launch_idx, recov_idx)
-
-        # Evaluate every *intermediate* stop for drone feasibility
-        for cust_idx in range(1, len(stops) - 1):
-            # launch/recovery based on current truck set
-            launch_idx = prev_truck(cust_idx)
-            recov_idx = next_truck(cust_idx)
-
-            launch, cust, recov = stops[launch_idx], stops[cust_idx], stops[recov_idx]
-            d_leg1 = haversine_miles(launch["lat"], launch["lon"], cust["lat"], cust["lon"])
-            d_leg2 = haversine_miles(cust["lat"], cust["lon"], recov["lat"], recov["lon"])
-
-            if d_leg1 + d_leg2 <= RANGE_MILES:
-                drone_assignments.append((cust_idx, launch_idx, recov_idx))
+        drone_cand = []
+        for idx in range(1, len(stops) - 1):
+            l, r = prev_truck(idx), next_truck(idx)
+            d = (
+                haversine_miles(stops[l]["lat"], stops[l]["lon"], stops[idx]["lat"], stops[idx]["lon"]) +
+                haversine_miles(stops[idx]["lat"], stops[idx]["lon"], stops[r]["lat"], stops[r]["lon"])
+            )
+            if d <= RANGE:
+                drone_cand.append((idx, l, r))
             else:
-                truck_indices.add(cust_idx)  # keep on truck route
+                truck_set.add(idx)
 
-        # Build ordered truck polyline
-        truck_path = [[stops[i]["lon"], stops[i]["lat"]] for i in sorted(truck_indices)]
+        # truck road path via Directions API
+        truck_seq = sorted(truck_set)
+        road_poly = []
+        for a, b in zip(truck_seq, truck_seq[1:]):
+            road_poly += road_path(stops[a]["lon"], stops[a]["lat"], stops[b]["lon"], stops[b]["lat"])[:-1]
+        road_poly.append([stops[truck_seq[-1]]["lon"], stops[truck_seq[-1]]["lat"]])
 
-        # Distribute sorties evenly across 4 drones
-        NUM_DRONES = 4
-        drone_bins: list[list[tuple]] = [[] for _ in range(NUM_DRONES)]
-        for n, assignment in enumerate(drone_assignments):
-            drone_bins[n % NUM_DRONES].append(assignment)
-
-        drone_polylines: list[list[list[float]]] = []
-        for bin_ in drone_bins:
-            if not bin_:
-                continue
-            poly: list[list[float]] = []
-            for cust_idx, launch_idx, recov_idx in bin_:
-                launch_pt = [stops[launch_idx]["lon"], stops[launch_idx]["lat"]]
-                cust_pt   = [stops[cust_idx]["lon"], stops[cust_idx]["lat"]]
-                recov_pt  = [stops[recov_idx]["lon"], stops[recov_idx]["lat"]]
-
-                if poly and poly[-1] == launch_pt:
-                    poly.extend([cust_pt, recov_pt])
+        # drones
+        bins = [[] for _ in range(4)]
+        for n, triple in enumerate(drone_cand):
+            bins[n % 4].append(triple)
+        drone_polys = []
+        for b in bins:
+            poly: List[List[float]] = []
+            for cid, l, r in b:
+                pts = [
+                    [stops[l]["lon"], stops[l]["lat"]],
+                    [stops[cid]["lon"], stops[cid]["lat"]],
+                    [stops[r]["lon"], stops[r]["lat"]],
+                ]
+                if poly and poly[-1] == pts[0]:
+                    poly.extend(pts[1:])
                 else:
-                    poly.extend([launch_pt, cust_pt, recov_pt])
-            drone_polylines.append(poly)
+                    poly.extend(pts)
+            if poly:
+                drone_polys.append(poly)
 
-        st.session_state["routes"] = {"truck": truck_path, "drones": drone_polylines}
-        st.success("✅ Routes replanned (3-mile drone eligibility) – map updated.")
+        st.session_state["routes"] = {"truck": road_poly, "drones": drone_polys}
+        st.success("✅ Planned with Mapbox Directions (truck road path)")
         st.rerun()
 
-    if col1.button("Commit / Plan Route"):
+    if col1.button("Commit / Plan"):
         plan_routes()
 
     if col2.button("Reset Telemetry"):
         st.session_state["vehicles"].clear()
-        st.session_state["_ping"] = not st.session_state.get("_ping", False)
-        st.info("Vehicle positions cleared.")
+        st.info("Cleared icons")
 
 # ---------------------------------------------------------------------------
-# End of file
+# end of file
 # ---------------------------------------------------------------------------
