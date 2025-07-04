@@ -20,7 +20,8 @@ from typing import List
 import streamlit as st
 import pydeck as pdk
 import pandas as pd
-import requests, sseclient, polyline
+import requests, sseclient
+import polyline  # pip install polyline
 
 MB_BASE = "https://api.mapbox.com/directions/v5/mapbox/driving"
 
