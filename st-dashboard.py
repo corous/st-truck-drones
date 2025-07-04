@@ -21,22 +21,43 @@ import streamlit as st
 import pydeck as pdk
 import pandas as pd
 import requests, sseclient
-import polyline  # pip install polyline
 
 MB_BASE = "https://api.mapbox.com/directions/v5/mapbox/driving"
 
-def road_path(lon1, lat1, lon2, lat2, access_token):
-    url = f"{MB_BASE}/{lon1},{lat1};{lon2},{lat2}"
+from urllib.parse import urlencode
+
+def road_segment(lon1, lat1, lon2, lat2):
     params = {
-        "geometries": "polyline6",  # highest-res encoding
+        "geometries": "polyline6",
         "overview": "full",
-        "access_token": access_token,
+        "access_token": MAPBOX_TOKEN,
     }
-    r = requests.get(url, params=params, timeout=10)
+    url = f"{MB_BASE}/{lon1},{lat1};{lon2},{lat2}?{urlencode(params)}"
+    r = requests.get(url, timeout=10)
     r.raise_for_status()
-    coords = polyline.decode(r.json()["routes"][0]["geometry"], precision=6)
-    # Mapbox → (lat, lon); PathLayer → [lon, lat]
-    return [[lon, lat] for lat, lon in coords]
+    encoded = r.json()["routes"][0]["geometry"]
+    # decode_polyline6 returns (lat, lon); convert to [lon, lat] for Deck.GL
+    return [[lon, lat] for lat, lon in decode_polyline6(encoded)]
+
+# --- tiny replacement for the “polyline” package --------------------------
+def decode_polyline6(encoded: str) -> list[list[float]]:
+    """Decode a polyline6 → list of (lat, lon)."""
+    coords, idx, lat, lon = [], 0, 0, 0
+    while idx < len(encoded):
+        for val in (lambda: None, lambda: None):  # loop twice (lat, lon)
+            res, shift, byte = 0, 0, 0x20
+            while byte >= 0x20:
+                byte = ord(encoded[idx]) - 63
+                idx += 1
+                res |= (byte & 0x1F) << shift
+                shift += 5
+            delta = ~(res >> 1) if res & 1 else res >> 1
+            if val is None:
+                lat += delta
+            else:
+                lon += delta
+        coords.append([lat * 1e-6, lon * 1e-6])  # precision = 6
+    return coords
 
 # ---------------------------------------------------------------------------
 # 1.  PAGE CONFIG (must be first Streamlit call)
@@ -281,15 +302,17 @@ with right:
             else:
                 truck_indices.add(cust_idx)  # keep on truck route
 
+
         # Build ordered truck polyline
         truck_indices_sorted = sorted(truck_indices)
         road_segments = []
         for a, b in zip(truck_indices_sorted, truck_indices_sorted[1:]):
-            road_segments += road_path(
+            road_segments += road_segment(
                 stops[a]["lon"], stops[a]["lat"],
                 stops[b]["lon"], stops[b]["lat"],
                 MAPBOX_TOKEN,
             )
+        # use the new road_segments function    
         truck_path = road_segments
 
         # Distribute sorties evenly across 4 drones
