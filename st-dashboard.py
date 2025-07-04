@@ -34,6 +34,7 @@ def road_segment(lon1, lat1, lon2, lat2):
     }
     url = f"{MB_BASE}/{lon1},{lat1};{lon2},{lat2}?{urlencode(params)}"
     r = requests.get(url, timeout=10)
+    st.write(r.status_code, r.text[:200])
     r.raise_for_status()
     encoded = r.json()["routes"][0]["geometry"]
     # decode_polyline6 returns (lat, lon); convert to [lon, lat] for Deck.GL
