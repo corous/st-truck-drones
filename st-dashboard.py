@@ -1,18 +1,6 @@
 # st-dashboard.py  – 2025‑06‑27
-"""Streamlit planner + live tracking.
-
-Key upgrade in this revision
----------------------------
-* Truck route (blue line) is now **road‑accurate**. For every
-  consecutive pair of truck stops we query the **Mapbox Directions** API
-  (driving profile), decode the returned polyline, and stitch those
-  segments together. The drones (purple lines) continue to fly straight.
-
-Prerequisites
--------------
-* Your Mapbox token must include the scope **directions:read**.
-* Add `requests` and `polyline` to `requirements.txt` if not present.
-"""
+# Streamlit planner + live tracking.
+# Road-accurate routes implemented
 
 from __future__ import annotations
 import json, math, os, threading, time, requests, polyline
